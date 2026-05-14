@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import MLXNN
+import MLXRandom
 
 /// A chunk of generated audio for streaming playback.
 public struct AudioChunk: Sendable {
@@ -638,6 +639,14 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
     ///   - referenceAudioCodes: Optional pre-encoded reference audio for ICL
     ///   - outputURL: File URL to write the WAV to
     ///   - temperature: Generation temperature
+    ///   - detailTemperature: Temperature for detail codebooks (1-15). Controls acoustic fidelity independently of the main temperature. When nil, defaults to max(0.3, temperature * 0.65)
+    ///   - topK: Top-K sampling filter. 0 disables. When nil, uses the model default
+    ///   - repetitionPenalty: Repetition penalty applied to previously generated tokens. 1.0 disables. When nil, uses the model default
+    ///   - maxChunkWords: Maximum words per text chunk. When nil, uses ``TextChunker/defaultMaxWords``
+    ///   - crossfadeSamples: Number of samples to crossfade between text chunks (default from configuration, typically 480 = 20ms at 24kHz)
+    ///   - iclMaxTokensCeiling: Maximum token cap for ICL generation. When nil, uses 600
+    ///   - iclTokensPerTextToken: Multiplier for text-token-based max token estimation in ICL mode. When nil, uses 6
+    ///   - seed: Optional RNG seed for reproducible generation. Sets the global MLX PRNG state before each chunk
     ///   - onProgress: Optional progress callback (0.0 to 1.0)
     /// - Returns: Total number of samples written
     /// - Throws: If writing fails
@@ -650,12 +659,26 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
         referenceAudioCodes: [[Int32]]? = nil,
         outputURL: URL,
         temperature: Float? = nil,
+        detailTemperature: Float? = nil,
+        topK: Int? = nil,
+        repetitionPenalty: Float? = nil,
+        maxChunkWords: Int? = nil,
+        crossfadeSamples: Int? = nil,
+        interChunkSilenceSamples: Int? = nil,
+        iclMaxTokensCeiling: Int? = nil,
+        iclTokensPerTextToken: Int? = nil,
+        seed: UInt64? = nil,
         onProgress: ((Float) -> Void)? = nil
     ) async throws -> Int {
         let temp = temperature ?? pipelineConfig.defaultTemperature
+        let chunkWords = maxChunkWords ?? TextChunker.defaultMaxWords
+        let crossfade = crossfadeSamples ?? pipelineConfig.crossfadeSamples
+        let gapSamples = max(0, interChunkSilenceSamples ?? 0)
+        let maxTokensCeiling = iclMaxTokensCeiling ?? 600
+        let tokensPerTextToken = iclTokensPerTextToken ?? 6
         let numCodeGroups = config.code_predictor_config.num_code_groups
 
-        let textChunks = TextChunker.chunk(text, maxWords: TextChunker.defaultMaxWords)
+        let textChunks = TextChunker.chunk(text, maxWords: chunkWords)
         guard !textChunks.isEmpty else { return 0 }
 
         let embeddingData = speakerEmbedding
@@ -664,6 +687,7 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
             try Device.withDefaultDevice(self.device) {
                 let writer = try StreamingWAVWriter(to: outputURL)
                 let speakerEmbed: MLXArray? = embeddingData.map { MLXArray($0) }
+                var previousTail: [Float] = []
 
                 for (chunkIndex, textChunk) in textChunks.enumerated() {
                     if Task.isCancelled {
@@ -674,7 +698,17 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
                     let progress = Float(chunkIndex) / Float(textChunks.count)
                     onProgress?(progress)
 
+                    if let seed {
+                        MLXRandom.seed(seed)
+                    }
+
                     self.model.clearGenerationCache()
+
+                    // Compute max tokens for this chunk: cap at ceiling, scale by text token count
+                    let chunkTextTokens = self.tokenizer.encode(
+                        text: "<|im_start|>assistant\n\(textChunk)<|im_end|>\n<|im_start|>assistant\n"
+                    ).shape[1]
+                    let chunkMaxTokens = min(maxTokensCeiling, max(75, chunkTextTokens * tokensPerTextToken))
 
                     var codes: [[Int32]] = []
                     autoreleasepool {
@@ -687,7 +721,10 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
                             referenceAudioCodes: referenceAudioCodes,
                             tokenizer: self.tokenizer,
                             temperature: temp,
-                            maxTokens: 600
+                            detailTemperature: detailTemperature,
+                            code0TopK: topK ?? 80,
+                            code0RepetitionPenalty: repetitionPenalty ?? 1.15,
+                            maxTokens: chunkMaxTokens
                         )
                     }
 
@@ -696,20 +733,41 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
 
                     guard !codes.isEmpty else { continue }
 
+                    // For ICL: prepend ref codes for decoder voice continuity (matches
+                    // Python mlx-audio _decode_icl_generated_codes), then trim the ref
+                    // portion proportionally from the output audio.
+                    var decodeCodes = codes
+                    var refFrameCount = 0
+                    if let refCodes = referenceAudioCodes, !refCodes.isEmpty, let refTime = refCodes.first?.count, refTime > 0 {
+                        var refFrames: [[Int32]] = []
+                        refFrames.reserveCapacity(refTime)
+                        for t in 0..<refTime {
+                            var frame: [Int32] = []
+                            frame.reserveCapacity(numCodeGroups)
+                            for q in 0..<min(refCodes.count, numCodeGroups) {
+                                frame.append(refCodes[q][t])
+                            }
+                            while frame.count < numCodeGroups { frame.append(0) }
+                            refFrames.append(frame)
+                        }
+                        decodeCodes = refFrames + codes
+                        refFrameCount = refTime
+                    }
+
                     // Decode in small batches
                     let samplesPerFrame = 1920
                     let decodeChunkSize = 16
                     let leftContextSize = 8
 
                     var chunkSamples: [Float] = []
-                    chunkSamples.reserveCapacity(codes.count * samplesPerFrame)
+                    chunkSamples.reserveCapacity(decodeCodes.count * samplesPerFrame)
                     var decodeLeftContext: [[Int32]] = []
                     var pos = 0
 
-                    while pos < codes.count {
+                    while pos < decodeCodes.count {
                         autoreleasepool {
-                            let endPos = min(pos + decodeChunkSize, codes.count)
-                            let batchCodes = decodeLeftContext + Array(codes[pos..<endPos])
+                            let endPos = min(pos + decodeChunkSize, decodeCodes.count)
+                            let batchCodes = decodeLeftContext + Array(decodeCodes[pos..<endPos])
 
                             let flatCodes: [Int32] = batchCodes.flatMap { $0 }
                             let codesArray = MLXArray(flatCodes).reshaped([1, batchCodes.count, numCodeGroups])
@@ -731,7 +789,7 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
                                 }
                             }
 
-                            decodeLeftContext = Array(codes[max(0, endPos - leftContextSize)..<endPos])
+                            decodeLeftContext = Array(decodeCodes[max(0, endPos - leftContextSize)..<endPos])
                             pos = endPos
                         }
 
@@ -739,12 +797,63 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
                         Memory.clearCache()
                     }
 
+                    // Trim ref portion from output (proportional to ref/total frames)
+                    if refFrameCount > 0 && !chunkSamples.isEmpty {
+                        let cutSamples = Int(Double(refFrameCount) / Double(max(decodeCodes.count, 1)) * Double(chunkSamples.count))
+                        if cutSamples > 0 && cutSamples < chunkSamples.count {
+                            chunkSamples = Array(chunkSamples.dropFirst(cutSamples))
+                        }
+                    }
+
                     guard !chunkSamples.isEmpty else { continue }
-                    try writer.write(samples: chunkSamples)
+
+                    let isLastChunk = chunkIndex == textChunks.count - 1
+
+                    // Chunk boundary handling. When gapSamples > 0 we treat the
+                    // boundary as a sentence-end pause: flush the previous tail
+                    // verbatim, insert silence, then fade the next chunk in from
+                    // zero. This avoids overlapping speech from two chunks. When
+                    // gapSamples == 0 we keep the original crossfade-blend
+                    // behaviour for backwards compatibility.
+                    if !previousTail.isEmpty {
+                        if gapSamples > 0 {
+                            try writer.write(samples: previousTail)
+                            try writer.write(samples: [Float](repeating: 0.0, count: gapSamples))
+                            if crossfade > 0 {
+                                let fadeLength = min(crossfade, chunkSamples.count)
+                                var fadedIn: [Float] = []
+                                fadedIn.reserveCapacity(fadeLength)
+                                for i in 0..<fadeLength {
+                                    fadedIn.append(chunkSamples[i] * (Float(i) / Float(fadeLength)))
+                                }
+                                try writer.write(samples: fadedIn)
+                                chunkSamples = Array(chunkSamples.dropFirst(fadeLength))
+                            }
+                        } else if crossfade > 0 {
+                            let fadeLength = min(crossfade, previousTail.count, chunkSamples.count)
+                            var crossfaded: [Float] = []
+                            for i in 0..<fadeLength {
+                                let fadeOut = Float(fadeLength - i) / Float(fadeLength)
+                                let fadeIn = Float(i) / Float(fadeLength)
+                                crossfaded.append(previousTail[i] * fadeOut + chunkSamples[i] * fadeIn)
+                            }
+                            try writer.write(samples: crossfaded)
+                            chunkSamples = Array(chunkSamples.dropFirst(fadeLength))
+                        }
+                        previousTail = []
+                    }
+
+                    if isLastChunk {
+                        try writer.write(samples: chunkSamples)
+                    } else if chunkSamples.count > crossfade && crossfade > 0 {
+                        try writer.write(samples: Array(chunkSamples.dropLast(crossfade)))
+                        previousTail = Array(chunkSamples.suffix(crossfade))
+                    } else {
+                        try writer.write(samples: chunkSamples)
+                    }
                     chunkSamples = []
 
                     self.model.clearGenerationCache()
-                    self.decoder.clearCompiledCache()
                     Stream.defaultStream(.gpu).synchronize()
                     Memory.clearCache()
                 }
@@ -767,8 +876,17 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
     ///   - text: Text to synthesize (any length)
     ///   - speaker: Speaker name
     ///   - speakerEmbedding: Optional speaker embedding for voice cloning
-    ///   - referenceTranscript: Optional transcript for ICL
+    ///   - referenceTranscript: Optional transcript for ICL voice cloning
+    ///   - referenceAudioCodes: Optional pre-encoded reference audio codes for ICL voice cloning
     ///   - temperature: Generation temperature
+    ///   - detailTemperature: Temperature for detail codebooks (1-15). Controls acoustic fidelity independently of the main temperature. When nil, defaults to max(0.3, temperature * 0.65)
+    ///   - topK: Top-K sampling filter. 0 disables. When nil, uses the model default
+    ///   - repetitionPenalty: Repetition penalty applied to previously generated tokens. 1.0 disables. When nil, uses the model default
+    ///   - maxChunkWords: Maximum words per text chunk. When nil, uses ``TextChunker/defaultMaxWords``
+    ///   - crossfadeSamples: Number of samples to crossfade between text chunks (default from configuration, typically 480 = 20ms at 24kHz)
+    ///   - iclMaxTokensCeiling: Maximum token cap for ICL generation. When nil, uses 600
+    ///   - iclTokensPerTextToken: Multiplier for text-token-based max token estimation in ICL mode. When nil, uses 6
+    ///   - seed: Optional RNG seed for reproducible generation. Sets the global MLX PRNG state before each chunk
     ///   - onProgress: Optional progress callback (0.0 to 1.0)
     /// - Returns: Audio samples at 24kHz
     public func generateBatch(
@@ -777,19 +895,36 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
         instruct: String? = nil,
         speakerEmbedding: [Float]? = nil,
         referenceTranscript: String? = nil,
+        referenceAudioCodes: [[Int32]]? = nil,
         temperature: Float? = nil,
+        detailTemperature: Float? = nil,
+        topK: Int? = nil,
+        repetitionPenalty: Float? = nil,
+        maxChunkWords: Int? = nil,
+        crossfadeSamples: Int? = nil,
+        interChunkSilenceSamples: Int? = nil,
+        iclMaxTokensCeiling: Int? = nil,
+        iclTokensPerTextToken: Int? = nil,
+        seed: UInt64? = nil,
         onProgress: ((Float) -> Void)? = nil
     ) async -> [Float] {
         let temp = temperature ?? pipelineConfig.defaultTemperature
-        let crossfade = pipelineConfig.crossfadeSamples
+        let crossfade = crossfadeSamples ?? pipelineConfig.crossfadeSamples
+        let gapSamples = max(0, interChunkSilenceSamples ?? 0)
+        let maxTokensCeiling = iclMaxTokensCeiling ?? 600
+        let tokensPerTextToken = iclTokensPerTextToken ?? 6
+        let chunkWords = maxChunkWords ?? TextChunker.defaultMaxWords
         let numCodeGroups = config.code_predictor_config.num_code_groups
 
-        let textChunks = TextChunker.chunk(text, maxWords: TextChunker.defaultMaxWords)
+        let textChunks = TextChunker.chunk(text, maxWords: chunkWords)
         guard !textChunks.isEmpty else { return [] }
 
         // Short text: single generation
         if textChunks.count == 1 {
             onProgress?(0.0)
+            if let seed {
+                MLXRandom.seed(seed)
+            }
             let samples = generate(text: textChunks[0], speaker: speaker, temperature: temp)
             onProgress?(1.0)
             return samples
@@ -810,18 +945,53 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
                     let progress = Float(chunkIndex) / Float(textChunks.count)
                     onProgress?(progress)
 
+                    if let seed {
+                        MLXRandom.seed(seed)
+                    }
+
+                    // Compute max tokens for this chunk: cap at ceiling, scale by text token count
+                    let chunkTextTokens = self.tokenizer.encode(
+                        text: "<|im_start|>assistant\n\(textChunk)<|im_end|>\n<|im_start|>assistant\n"
+                    ).shape[1]
+                    let chunkMaxTokens = min(maxTokensCeiling, max(75, chunkTextTokens * tokensPerTextToken))
+
                     let codes = self.model.generateCodes(
                         prompt: speaker,
                         text: textChunk,
                         instruct: instruct,
                         speakerEmbedding: speakerEmbed,
                         referenceTranscript: referenceTranscript,
+                        referenceAudioCodes: referenceAudioCodes,
                         tokenizer: self.tokenizer,
                         temperature: temp,
-                        maxTokens: 600
+                        detailTemperature: detailTemperature,
+                        code0TopK: topK ?? 80,
+                        code0RepetitionPenalty: repetitionPenalty ?? 1.15,
+                        maxTokens: chunkMaxTokens
                     )
 
                     guard !codes.isEmpty else { continue }
+
+                    // For ICL: prepend ref codes for decoder voice continuity (matches
+                    // Python mlx-audio _decode_icl_generated_codes), then trim the ref
+                    // portion proportionally from the output audio.
+                    var decodeCodes = codes
+                    var refFrameCount = 0
+                    if let refCodes = referenceAudioCodes, !refCodes.isEmpty, let refTime = refCodes.first?.count, refTime > 0 {
+                        var refFrames: [[Int32]] = []
+                        refFrames.reserveCapacity(refTime)
+                        for t in 0..<refTime {
+                            var frame: [Int32] = []
+                            frame.reserveCapacity(numCodeGroups)
+                            for q in 0..<min(refCodes.count, numCodeGroups) {
+                                frame.append(refCodes[q][t])
+                            }
+                            while frame.count < numCodeGroups { frame.append(0) }
+                            refFrames.append(frame)
+                        }
+                        decodeCodes = refFrames + codes
+                        refFrameCount = refTime
+                    }
 
                     // Decode in batches
                     let samplesPerFrame = 1920
@@ -832,9 +1002,9 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
                     var decodeLeftContext: [[Int32]] = []
                     var pos = 0
 
-                    while pos < codes.count {
-                        let endPos = min(pos + decodeChunkSize, codes.count)
-                        let batchCodes = decodeLeftContext + Array(codes[pos..<endPos])
+                    while pos < decodeCodes.count {
+                        let endPos = min(pos + decodeChunkSize, decodeCodes.count)
+                        let batchCodes = decodeLeftContext + Array(decodeCodes[pos..<endPos])
 
                         let flatCodes: [Int32] = batchCodes.flatMap { $0 }
                         let codesArray = MLXArray(flatCodes).reshaped([1, batchCodes.count, numCodeGroups])
@@ -856,26 +1026,54 @@ public final class Qwen3TTSPipeline: @unchecked Sendable {
                             }
                         }
 
-                        decodeLeftContext = Array(codes[max(0, endPos - leftContextSize)..<endPos])
+                        decodeLeftContext = Array(decodeCodes[max(0, endPos - leftContextSize)..<endPos])
                         pos = endPos
 
                         DeviceSelector.synchronizeIfNeeded(device: self.device)
                         Memory.clearCache()
                     }
 
+                    // Trim ref portion from output (proportional to ref/total frames)
+                    if refFrameCount > 0 && !chunkSamples.isEmpty {
+                        let cutSamples = Int(Double(refFrameCount) / Double(max(decodeCodes.count, 1)) * Double(chunkSamples.count))
+                        if cutSamples > 0 && cutSamples < chunkSamples.count {
+                            chunkSamples = Array(chunkSamples.dropFirst(cutSamples))
+                        }
+                    }
+
                     guard !chunkSamples.isEmpty else { continue }
 
-                    // Crossfade with previous chunk
-                    if !previousTail.isEmpty && crossfade > 0 {
-                        let fadeLength = min(crossfade, previousTail.count, chunkSamples.count)
-                        var crossfaded: [Float] = []
-                        for i in 0..<fadeLength {
-                            let fadeOut = Float(fadeLength - i) / Float(fadeLength)
-                            let fadeIn = Float(i) / Float(fadeLength)
-                            crossfaded.append(previousTail[i] * fadeOut + chunkSamples[i] * fadeIn)
+                    // Chunk boundary handling. See `generateToFile` for the
+                    // rationale: gapSamples > 0 inserts a sentence-end pause and
+                    // fades the next chunk in from zero, avoiding overlapping
+                    // speech. gapSamples == 0 falls back to the original
+                    // crossfade-blend behaviour.
+                    if !previousTail.isEmpty {
+                        if gapSamples > 0 {
+                            allSamples.append(contentsOf: previousTail)
+                            allSamples.append(contentsOf: [Float](repeating: 0.0, count: gapSamples))
+                            if crossfade > 0 {
+                                let fadeLength = min(crossfade, chunkSamples.count)
+                                var fadedIn: [Float] = []
+                                fadedIn.reserveCapacity(fadeLength)
+                                for i in 0..<fadeLength {
+                                    fadedIn.append(chunkSamples[i] * (Float(i) / Float(fadeLength)))
+                                }
+                                allSamples.append(contentsOf: fadedIn)
+                                chunkSamples = Array(chunkSamples.dropFirst(fadeLength))
+                            }
+                        } else if crossfade > 0 {
+                            let fadeLength = min(crossfade, previousTail.count, chunkSamples.count)
+                            var crossfaded: [Float] = []
+                            for i in 0..<fadeLength {
+                                let fadeOut = Float(fadeLength - i) / Float(fadeLength)
+                                let fadeIn = Float(i) / Float(fadeLength)
+                                crossfaded.append(previousTail[i] * fadeOut + chunkSamples[i] * fadeIn)
+                            }
+                            allSamples.append(contentsOf: crossfaded)
+                            chunkSamples = Array(chunkSamples.dropFirst(fadeLength))
                         }
-                        allSamples.append(contentsOf: crossfaded)
-                        chunkSamples = Array(chunkSamples.dropFirst(fadeLength))
+                        previousTail = []
                     }
 
                     if isLastChunk {
