@@ -335,28 +335,6 @@ nonisolated public class EncoderTransformer: Module {
     }
 }
 
-// MARK: - Encoder Downsample
-
-nonisolated public class EncoderDownsample: Module {
-    let conv: MimiConv1d
-
-    public init(config: Qwen3TTSTokenizerEncoderConfig) {
-        // Conv1d(512→512, kernel=2*compress, stride=compress) for 2× temporal compression
-        self.conv = MimiConv1d(
-            inChannels: config.hidden_size,
-            outChannels: config.hidden_size,
-            kernelSize: 2 * config.compress,
-            stride: config.compress
-        )
-        super.init()
-    }
-
-    /// Input: [B, C, T] -> Output: [B, C, T/compress]
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
-        conv(x)
-    }
-}
-
 // MARK: - Encoder Vector Quantization
 
 nonisolated public class EncoderVectorQuantization: Module {

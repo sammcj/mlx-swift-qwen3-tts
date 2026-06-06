@@ -10,6 +10,11 @@ public struct TextChunker {
     /// Default minimum words to consider for a chunk (avoid tiny fragments).
     public static let defaultMinWords = 8
 
+    /// Deprecated alias for ``defaultMinWords``, kept so external consumers that
+    /// referenced the old name keep compiling.
+    @available(*, deprecated, renamed: "defaultMinWords")
+    public static let minWords = defaultMinWords
+
     /// Conjunctions that indicate clause boundaries (split BEFORE these)
     private static let conjunctions = [
         " and then ", " and ", " but ", " or ", " so ", " because ",

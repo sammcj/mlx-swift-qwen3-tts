@@ -541,14 +541,6 @@ nonisolated public class SpeakerEncoder: Module {
         return embedding
     }
 
-    private func transposeConv(_ weight: MLXArray) -> MLXArray {
-        // Main model.safetensors weights are already in MLX format [out, kernel, in].
-        // Only transpose if they're in PyTorch format [out, in, kernel].
-        // Detect by checking if the last dim matches what Conv1d expects (input channels).
-        // For safety, skip transpose - mlx-community models are pre-converted.
-        return weight
-    }
-
     public func load(weights: [String: MLXArray]) {
         var w: [String: MLXArray] = [:]
         for (key, val) in weights where key.hasPrefix("speaker_encoder.") {
@@ -562,8 +554,10 @@ nonisolated public class SpeakerEncoder: Module {
 
         func loadConv(_ conv: Conv1d, weightKey: String, biasKey: String) {
             if let wt = w[weightKey], let b = w[biasKey] {
+                // model.safetensors weights from mlx-community are already in MLX
+                // Conv1d format [out, kernel, in]; no transpose needed.
                 let params = ModuleParameters.unflattened([
-                    "weight": transposeConv(wt),
+                    "weight": wt,
                     "bias": b
                 ])
                 _ = try? conv.update(parameters: params, verify: .none)

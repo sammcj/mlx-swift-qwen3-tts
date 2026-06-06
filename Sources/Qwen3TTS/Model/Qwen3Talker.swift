@@ -324,6 +324,25 @@ nonisolated public class Qwen3Talker: Module {
 
     // MARK: - Generation
 
+    /// True when every codebook row has the same non-zero length. The ICL paths
+    /// index `refCodes[q][t]` and sum per-codebook `MLXArray`s, so a jagged array
+    /// would trap on index-out-of-range or abort on an MLX broadcast mismatch.
+    public static func referenceCodesAreRectangular(_ codes: [[Int32]]) -> Bool {
+        guard let width = codes.first?.count, width > 0 else { return false }
+        return codes.allSatisfy { $0.count == width }
+    }
+
+    /// True when the inputs constitute a valid ICL voice-cloning request: a
+    /// non-empty reference transcript plus rectangular reference audio codes with
+    /// at least one frame. Mirrors the guard on the ICL prefill branch so the
+    /// repetition-penalty floor and KV-cache trimming policy never diverge from
+    /// the path that actually runs.
+    public static func isICLInput(referenceAudioCodes: [[Int32]]?, referenceTranscript: String?) -> Bool {
+        guard let transcript = referenceTranscript, !transcript.isEmpty else { return false }
+        guard let refCodes = referenceAudioCodes, referenceCodesAreRectangular(refCodes) else { return false }
+        return true
+    }
+
     /// Generate audio codes without decoding (for batch decoding later).
     public func generateCodes(
         prompt: String,
@@ -337,12 +356,18 @@ nonisolated public class Qwen3Talker: Module {
         detailTemperature: Float? = nil,
         code0TopK: Int = 80,
         code0RepetitionPenalty: Float = 1.15,
-        maxTokens: Int = 1200
+        maxTokens: Int = 1200,
+        iclMaxTokensCeiling: Int? = nil,
+        iclTokensPerTextToken: Int? = nil
     ) -> [[Int32]] {
         // Detail codes (1-15) use lower temperature for acoustic fidelity;
         // code0 (semantic/prosodic) keeps the user-specified temperature for natural variation.
         let resolvedDetailTemp = detailTemperature ?? max(0.3, temperature * 0.65)
-        let useICL = referenceAudioCodes != nil && referenceTranscript != nil && !referenceTranscript!.isEmpty
+        // useICL must match the conditions of the ICL prefill branch below exactly.
+        // A non-nil-but-empty (or zero-frame) referenceAudioCodes is NOT ICL: it must
+        // not floor the repetition penalty or disable KV-cache trimming for what is
+        // really a normal generation.
+        let useICL = Qwen3Talker.isICLInput(referenceAudioCodes: referenceAudioCodes, referenceTranscript: referenceTranscript)
         let speakerName = prompt.lowercased()
         let speakerId = config.spk_id[speakerName]
         let debugGenEntry = ProcessInfo.processInfo.environment["DUPER_DEBUG_GENERATION"] == "1"
@@ -357,6 +382,15 @@ nonisolated public class Qwen3Talker: Module {
         guard inputIds.shape[1] >= minTokens else {
             if debugGenEntry { print("DEBUG [generateCodes]: input too short (\(inputIds.shape[1]) < \(minTokens))") }
             return []
+        }
+
+        // When ICL sizing hints are supplied, derive the per-call token cap from the
+        // already-tokenized input instead of having the caller tokenize a second time.
+        let resolvedMaxTokens: Int
+        if let ceiling = iclMaxTokensCeiling, let perToken = iclTokensPerTextToken {
+            resolvedMaxTokens = min(ceiling, max(75, inputIds.shape[1] * perToken))
+        } else {
+            resolvedMaxTokens = maxTokens
         }
 
         let ttsTokens = MLXArray([Int32(config.tts_bos_token_id), Int32(config.tts_eos_token_id), Int32(config.tts_pad_token_id)]).expandedDimensions(axis: 0)
@@ -516,7 +550,7 @@ nonisolated public class Qwen3Talker: Module {
 
         let totalTextTokens = trailingTextHidden.shape[1]
 
-        for step in 0..<maxTokens {
+        for step in 0..<resolvedMaxTokens {
             if Task.isCancelled { break }
             if debugGen && (step < 3 || step % 50 == 0) {
                 print("DEBUG [generateCodes]: step \(step), logits shape=\(logits.shape), trailingIdx=\(trailingIdx)/\(totalTextTokens)")
@@ -614,6 +648,12 @@ nonisolated public class Qwen3Talker: Module {
                 // In ICL mode, trimming evicts the reference conditioning from KV cache,
                 // causing the model to lose voice identity after ~15 steps. The Python
                 // mlx-audio implementation does not trim during ICL generation.
+                //
+                // Memory note: with trimming disabled, peak KV memory for an ICL call is
+                // bounded by prefill(ref codes + ref text + target text) + resolvedMaxTokens
+                // rather than maxKVCacheWindow. The pipeline resets the cache per chunk, so
+                // this peak is per-chunk, not cumulative across the whole utterance. A long
+                // reference combined with a raised iclMaxTokensCeiling raises that peak.
                 if !useICL {
                     cache = trimKVCache(cache, maxWindow: maxKVCacheWindow)
                 }
@@ -717,7 +757,8 @@ nonisolated public class Qwen3Talker: Module {
         let config = self.config
         let resolvedDetailTemp = detailTemperature ?? max(0.3, temperature * 0.65)
 
-        let useICL = referenceAudioCodes != nil && referenceTranscript != nil && !referenceTranscript!.isEmpty
+        // Match the ICL prefill branch exactly (see isICLInput / generateCodes).
+        let useICL = Qwen3Talker.isICLInput(referenceAudioCodes: referenceAudioCodes, referenceTranscript: referenceTranscript)
 
         return AsyncThrowingStream<[[Int32]], Error> { (continuation: AsyncThrowingStream<[[Int32]], Error>.Continuation) in
             Task {

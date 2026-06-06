@@ -28,14 +28,6 @@ let package = Package(
             ],
             path: "Sources/Qwen3TTS"
         ),
-        .executableTarget(
-            name: "EncoderRoundTrip",
-            dependencies: [
-                "Qwen3TTS",
-                .product(name: "MLX", package: "mlx-swift"),
-            ],
-            path: "Sources/EncoderRoundTrip"
-        ),
         .testTarget(
             name: "Qwen3TTSTests",
             dependencies: ["Qwen3TTS"],
