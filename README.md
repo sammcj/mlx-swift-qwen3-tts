@@ -2,6 +2,8 @@
 
 A Swift Package for running [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS) text-to-speech models on Apple Silicon using [MLX](https://github.com/ml-explore/mlx-swift).
 
+Fork of [hamptus/mlx-swift-qwen3-tts](https://github.com/hamptus/mlx-swift-qwen3-tts) (Apache 2.0) with exposed inference parameters and fixes to voice cloning and chunked audio quality.
+
 ## Features
 
 - High-quality text-to-speech with multiple built-in voices
@@ -26,7 +28,7 @@ Add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/hamptus/mlx-swift-qwen3-tts", from: "0.2.0"),
+    .package(url: "https://github.com/sammcj/mlx-swift-qwen3-tts", branch: "main"),
 ]
 ```
 
